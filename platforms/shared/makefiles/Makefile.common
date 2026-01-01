@@ -30,6 +30,9 @@ INCLUDES += -I$(DEPS_DIR)/nfd
 INCLUDES += -I$(DEPS_DIR)/stb
 INCLUDES += -I$(DEPS_DIR)/json
 
+# $(curl-config --cflags --libs)
+LDFLAGS += -lcurl
+
 USE_CLANG ?= 0
 ifeq ($(USE_CLANG), 1)
     CXX = clang++

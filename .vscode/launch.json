@@ -16,7 +16,8 @@
                 "cwd": "${workspaceFolder}/platforms/macos",
                 "MIMode": "lldb",
                 "externalConsole": true,
-                "targetArchitecture": "arm64"
+                "targetArchitecture": "arm64",
+                "args": ["/path/to/test-application/fcs.lnx"]
             },
             "args": [],
             "stopAtEntry": false,

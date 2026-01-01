@@ -20,6 +20,8 @@
 #ifndef MIKEY_INLINE_H
 #define MIKEY_INLINE_H
 
+#include <curl/curl.h>
+
 #include "mikey.h"
 #include "audio.h"
 #include "suzy.h"
@@ -27,6 +29,8 @@
 #include "m6502.h"
 #include "bit_ops.h"
 #include "bus.h"
+
+static const char hex[] = "0123456789abcdef";
 
 INLINE bool Mikey::Clock(u32 cycles)
 {
@@ -129,13 +133,92 @@ INLINE u8 Mikey::Read(u16 address)
             u8 ret = m_state.uart.rx_data;
             DebugMikey("Reading SERDAT (RX): %02X", ret);
 
-            if (m_state.uart.rxq_count > 0)
+            if (m_responseCode != 0)
             {
-                m_state.uart.rxq_head ^= 1;
-                m_state.uart.rxq_count--;
-            }
+                // Send a byte from the response chunk buffer if available
+                if (m_responseCode == 0xb0 && m_responseChunkIndex <0xffff)
+                {
+                    m_state.uart.rx_data  = m_responseChunk[m_responseChunkIndex];
+                    m_responseChunkIndex++;
 
-            UartRxReflectHead();
+                    // End of chunk reached
+                    if (m_responseChunkIndex >= m_responseChunkSize)
+                    {
+                        
+                        m_responseCode = 0;
+                        m_responseChunkIndex=0xffff;
+
+                        Debug("UART: - chunk complete");
+
+                        // End of entire response (all chunks) reached
+                        if (m_responseIndex >= m_responseSize)
+                        {
+                            Debug("UART: - response complete");
+                            m_responseSize = 0;
+                        }
+                    }
+                }
+                else 
+                {
+                    // If not sending a chunk, send our single byte response (ACK, etc)
+                    m_state.uart.rx_data  = m_responseCode; 
+                }
+               
+                m_state.uart.rx_ready = true;
+                
+                // If we just sent our "okay, we'll start sending" response, prepare next chunk
+                if (m_responseCode == 0xb0 && m_responseChunkIndex == 0xffff)
+                {   
+                    // Reset chunk index and size
+                    m_responseChunkIndex=0;
+                    m_responseChunkSize = m_responseSize - m_responseIndex;
+                    if (m_responseChunkSize > RESPONSE_CHUNK_SIZE)
+                        m_responseChunkSize = RESPONSE_CHUNK_SIZE;
+
+                    // Encode chunk payload size
+                    m_responseChunk[0] = (m_responseChunkSize >> 8) & 0xFF;
+                    m_responseChunk[1] = (m_responseChunkSize & 0xFF);
+                    
+                    // Write chunk data
+                    memcpy(&m_responseChunk[2], &m_response[m_responseIndex], m_responseChunkSize);
+
+                    // Increment overall response index
+                    m_responseIndex += m_responseChunkSize;
+                            
+                    Debug("UART: - send %u bytes - first 8: %02x %02x %02x %02x %02x %02x %02x %02x", m_responseChunkSize,
+                        m_responseChunk[0], m_responseChunk[1], m_responseChunk[2], m_responseChunk[3],
+                        m_responseChunk[4], m_responseChunk[5], m_responseChunk[6], m_responseChunk[7]
+                    );
+
+                    // Finally, add checksum byte for this chunk
+                    u8 checksum = 0;
+                    for (u16 i = 0; i < m_responseChunkSize; ++i)
+                        checksum ^= m_responseChunk[2+i];
+                    
+                    m_responseChunk[m_responseChunkSize+2] = checksum;
+
+                    // Total chunk size includes 2 bytes for length + data + 1 byte checksum
+                    m_responseChunkSize+=3;
+                    
+                }
+                else if (m_responseCode != 0xb0)
+                {
+                    // If we sent any single byte response other than "start sending chunks", clear it
+                    m_responseCode = 0;
+                }
+  
+            }
+            else 
+            {
+                // Existing behavior
+                if (m_state.uart.rxq_count > 0)
+                {
+                    m_state.uart.rxq_head ^= 1;
+                    m_state.uart.rxq_count--;
+                }    
+
+                UartRxReflectHead();
+            }
             UartRelevelIRQ();
             return ret;
         }
@@ -997,6 +1080,16 @@ inline void Mikey::UartRxReflectHead()
     }
 }
 
+// Callback used by libcurl to write downloaded data
+static size_t write_callback(void* contents, size_t size, size_t nmemb, void* userp)
+{
+    size_t total_size = size * nmemb;
+    std::string* buffer = static_cast<std::string*>(userp);
+    buffer->append(static_cast<char*>(contents), total_size);
+    return total_size;
+}
+
+            
 inline void Mikey::UartRxPush(u8 data, bool parbit, bool parerr, bool framerr, bool rxbreak)
 {
     if (m_state.uart.rxq_count < 2)
@@ -1006,6 +1099,126 @@ inline void Mikey::UartRxPush(u8 data, bool parbit, bool parerr, bool framerr, b
         m_state.uart.rxq_data[tail] = data;
         m_state.uart.rxq_flags[tail] = flags;
         m_state.uart.rxq_count++;
+        m_payload[m_payloadSize++] = data;
+
+        // ACK 0x2E / NACK 0x7E
+        // Receive mode
+        if (m_payloadSize==1 && data == 0x2E)
+        {
+            Debug("UART: rcv ACK: %02x", data);
+            m_payloadSize = 0;
+            //m_responseCode = 1; // ACK
+        }
+        else if (m_payloadSize==1 && data == 0x7E)
+        {
+            Debug("UART: rcv NACK: %02x", data);
+            m_payloadSize = 0;
+            //m_responseCode = 1; // ACK
+        }
+        else if (m_payloadSize==1 && data == 0x4E)
+        {
+             
+            if (m_responseSize == 0)
+            {
+                m_responseCode = 0xC0; // NACK    
+                Debug("UART: rcv RECV (replied NACK 0xC0): %02x", data);
+            }
+            else 
+            {
+                m_responseCode = 0x90; // ACK    
+                Debug("UART: rcv RECV (replied ACK 0x90): %02x", data);
+            }
+            //m_expectedPayloadSize = 0;
+            m_payloadSize = 0;
+           
+        }
+        // Clear to send mode
+        else if (m_payloadSize==1 && data == 0x3E)
+        {
+             Debug("UART: rcv CLR (replied 0xb0): %02x", data);
+            m_payloadSize = 0;
+            m_responseCode = 0xb0; // CTS
+            m_responseChunkIndex=0xffff;
+        }
+        // Once we've read fujinet header, calculate payload size and reset
+        else if (m_expectedPayloadSize==0 && m_payloadSize == 3)
+        {
+            m_expectedPayloadSize = ((u16)m_payload[1] << 8) | m_payload[2];
+            m_payloadSize = 0;
+            Debug("UART: rcv SEND: %02x %02x %02x (expecting %d bytes to follow)", m_payload[0], m_payload[1], m_payload[2], m_expectedPayloadSize);
+        } else if (m_expectedPayloadSize>0 && m_payloadSize > m_expectedPayloadSize)
+        {
+            Debug("UART: - rcv (cmd mode trans): %02x %02x %02x", m_payload[0], m_payload[1], m_payload[2]);
+            
+            u8 checksum_received = m_payload[m_payloadSize-1];
+            u8 checksum = 0;
+            for (u16 i = 0; i < m_expectedPayloadSize; ++i)
+                checksum ^= m_payload[i];
+            if (checksum != checksum_received)
+            {
+                Debug("UART: - Checksum error: calculated %02x, received %02x", checksum, checksum_received); 
+            }
+            else
+            {
+                Debug("UART: - Checksum valid: %02x", checksum);
+            }
+            
+            m_url = std::string((char*)&m_payload[3], strlen((char*)&m_payload[3]));
+
+            // Debug print the full payload
+            std::string payload_debug = "UART: - rcv bytes:";
+            for (u16 i = 0; i < m_expectedPayloadSize; i++) {
+                if (i % 16 == 0)
+                    payload_debug += "\n     ";
+                payload_debug += " ";
+                payload_debug += hex[m_payload[i] >> 4];
+                payload_debug += hex[m_payload[i] & 0x0f];
+            }
+
+            Debug(payload_debug.c_str());
+            
+            
+            // FujiNet packet received - check 
+            if (m_payload[0]=='O')
+            {
+                    Debug("UART: (O)pen URL: %s", m_url.c_str());
+                    
+                    // Skip first two bytes ("N:")
+                    m_url = std::string((char*)&m_payload[5], strlen((char*)&m_payload[5]));
+                    
+                    CURL* curl = curl_easy_init();
+                    // if (!curl)
+                    //     throw std::runtime_error("Failed to initialize curl");
+
+                    std::string result;
+
+                    curl_easy_setopt(curl, CURLOPT_URL, m_url.c_str());
+                    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+                    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+                    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result);
+
+                    CURLcode res = curl_easy_perform(curl);
+                    curl_easy_cleanup(curl);
+
+                    // if (res != CURLE_OK)
+                    //     throw std::runtime_error(curl_easy_strerror(res));
+
+                    m_responseSize = result.size();
+                    Debug("UART: - URL result size: %d bytes", m_responseSize);
+                    memcpy(&m_response, result.data(), m_responseSize); //sizeof(m_responseSize));
+
+                    m_responseIndex=0;
+
+            } else if (m_payload[0]=='C')
+            {    
+                Debug("UART: (C)lose: %s", m_url.c_str());
+            }
+
+            m_expectedPayloadSize = 0;
+            m_payloadSize = 0;
+            m_responseCode = 0x90; // ACK
+            Debug("UART: - sent ACK (0x90)");
+        }
     }
     else
         m_state.uart.ovr_err = true;
