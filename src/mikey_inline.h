@@ -1101,23 +1101,20 @@ inline void Mikey::UartRxPush(u8 data, bool parbit, bool parerr, bool framerr, b
         m_state.uart.rxq_count++;
         m_payload[m_payloadSize++] = data;
 
-        // ACK 0x2E / NACK 0x7E
-        // Receive mode
-        if (m_payloadSize==1 && data == 0x2E)
+        // Check first byte of payload
+        if (m_payloadSize==1 && (data & 0xF0) == 0x20)
         {
             Debug("UART: rcv ACK: %02x", data);
             m_payloadSize = 0;
-            //m_responseCode = 1; // ACK
         }
-        else if (m_payloadSize==1 && data == 0x7E)
+        else if (m_payloadSize==1 && (data & 0xF0) == 0x70)
         {
             Debug("UART: rcv NACK: %02x", data);
             m_payloadSize = 0;
-            //m_responseCode = 1; // ACK
         }
-        else if (m_payloadSize==1 && data == 0x4E)
+        else if (m_payloadSize==1 && (data & 0xF0) == 0x40)
         {
-             
+            // Nothing more to send
             if (m_responseSize == 0)
             {
                 m_responseCode = 0xC0; // NACK    
@@ -1128,28 +1125,32 @@ inline void Mikey::UartRxPush(u8 data, bool parbit, bool parerr, bool framerr, b
                 m_responseCode = 0x90; // ACK    
                 Debug("UART: rcv RECV (replied ACK 0x90): %02x", data);
             }
-            //m_expectedPayloadSize = 0;
             m_payloadSize = 0;
            
         }
         // Clear to send mode
-        else if (m_payloadSize==1 && data == 0x3E)
+        else if (m_payloadSize==1 && (data & 0xF0) == 0x30)
         {
              Debug("UART: rcv CLR (replied 0xb0): %02x", data);
             m_payloadSize = 0;
             m_responseCode = 0xb0; // CTS
             m_responseChunkIndex=0xffff;
         }
-        // Once we've read fujinet header, calculate payload size and reset
-        else if (m_expectedPayloadSize==0 && m_payloadSize == 3)
+        // Receiving packet - once we've read three bytes (header), calculate payload size for rest
+        else if (m_payloadSize == 3 && m_expectedPayloadSize==0 && (m_payload[0] & 0xF0) == 0x60)
         {
             m_expectedPayloadSize = ((u16)m_payload[1] << 8) | m_payload[2];
-            m_payloadSize = 0;
             Debug("UART: rcv SEND: %02x %02x %02x (expecting %d bytes to follow)", m_payload[0], m_payload[1], m_payload[2], m_expectedPayloadSize);
-        } else if (m_expectedPayloadSize>0 && m_payloadSize > m_expectedPayloadSize)
+        }
+        else if (m_expectedPayloadSize>0 && (m_payloadSize-3) > m_expectedPayloadSize)
         {
+            // Shift entire payload left by 3 bytes
+            memmove(&m_payload[0], &m_payload[3], m_payloadSize-3);
+            m_payloadSize -= 3;
+
             Debug("UART: - rcv (cmd mode trans): %02x %02x %02x", m_payload[0], m_payload[1], m_payload[2]);
             
+            // Compare checksum
             u8 checksum_received = m_payload[m_payloadSize-1];
             u8 checksum = 0;
             for (u16 i = 0; i < m_expectedPayloadSize; ++i)
@@ -1163,11 +1164,9 @@ inline void Mikey::UartRxPush(u8 data, bool parbit, bool parerr, bool framerr, b
                 Debug("UART: - Checksum valid: %02x", checksum);
             }
             
-            m_url = std::string((char*)&m_payload[3], strlen((char*)&m_payload[3]));
-
-            // Debug print the full payload
+            // Debug print the full payload + checksum
             std::string payload_debug = "UART: - rcv bytes:";
-            for (u16 i = 0; i < m_expectedPayloadSize; i++) {
+            for (u16 i = 0; i < m_expectedPayloadSize+1; i++) {
                 if (i % 16 == 0)
                     payload_debug += "\n     ";
                 payload_debug += " ";
@@ -1183,7 +1182,7 @@ inline void Mikey::UartRxPush(u8 data, bool parbit, bool parerr, bool framerr, b
             {
                     Debug("UART: (O)pen URL: %s", m_url.c_str());
                     
-                    // Skip first two bytes ("N:")
+                    // Extran url - skip 3 header bytes + first 2 "N:" url bytes
                     m_url = std::string((char*)&m_payload[5], strlen((char*)&m_payload[5]));
                     
                     CURL* curl = curl_easy_init();
